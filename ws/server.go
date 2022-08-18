@@ -58,11 +58,11 @@ func (s *server) acceptLoop() {
 			}
 			c := &socket{
 				conn: conn,
-				messageHandler: func(messsageType byte, r io.Reader, fin bool) {
+				frameHandler: func(messsageType byte, payload []byte, fin bool) {
 				},
 				serverQuit: s.quitCh,
 			}
-			go c.readLoop()
+			go c.run()
 
 			s.acceptHandler(nil, c)
 		}

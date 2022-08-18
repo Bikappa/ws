@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"io"
 )
 
 type EchoServer struct {
@@ -18,19 +17,25 @@ func (e *EchoServer) Listen(url string) {
 			panic(err)
 		}
 
+		// for the echo server testing purposes we want to read frame by frame
+		// which may not be available in the public interface
+		is, ok := s.(*socket)
+		if !ok {
+			panic("Unrecognized socket")
+		}
+
 		msgType := byte(0x00)
 		var fragments [][]byte
 
-		s.OnFrame(func(fragmentType byte, r io.Reader, fin bool) {
-			buf := new(bytes.Buffer)
-			io.Copy(buf, r)
+		is.OnFrame(func(fragmentType byte, payload []byte, fin bool) {
 
 			fmt.Println("Received frame")
 			fmt.Println("Fin:", fin)
 			fmt.Println("FragmentType:", fragmentType)
-			fmt.Println(hex.Dump(buf.Bytes()))
+			fmt.Println("length:", len(payload))
+			fmt.Println(hex.Dump(payload))
 
-			fragments = append(fragments, buf.Bytes())
+			fragments = append(fragments, payload)
 			if len(fragments) == 1 {
 				msgType = fragmentType
 			}
@@ -41,7 +46,7 @@ func (e *EchoServer) Listen(url string) {
 					if i != 0 {
 						fragmentOpcode = OPCODE_CONTINUATION
 					}
-					s.SendMessage(fragmentOpcode, bytes.NewReader(data), i == len(fragments)-1)
+					is.sendFrame(fragmentOpcode, bytes.NewReader(data), i == len(fragments)-1)
 				}
 				fragments = nil
 			}

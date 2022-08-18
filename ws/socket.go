@@ -6,29 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"unicode/utf8"
 )
 
-type SocketV2 interface {
+type Socket interface {
 	OnText(h TextHandler)
 	OnBinary(h BinaryHandler)
-	OnStream(h StreamStartHandler)
+	OnStreamStart(h StreamStartHandler)
+	SendMessage(messageType byte, r io.Reader)
 	Close() error
 }
 
 type MessageType uint16
-type FrameHandler func(byte, io.Reader, bool)
+type FrameHandler func(byte, []byte, bool)
 type TextHandler func(text string)
 type BinaryHandler func(data []byte)
 type StreamStartHandler func(t *MessageType, r io.Reader)
-
-type Socket interface {
-	OnFrame(handler FrameHandler)
-	SendMessage(messageType byte, r io.Reader, fin bool) error
-	Close() error
-}
 
 const (
 	OPCODE_CONTINUATION = 0x0
@@ -70,7 +64,9 @@ const (
 
 type socket struct {
 	conn              net.Conn
-	messageHandler    FrameHandler
+	frameHandler      FrameHandler
+	textHandler       TextHandler
+	binaryHandler     BinaryHandler
 	isContinuing      bool
 	fragmentedMsgType byte
 	danglingUTF8Bytes []byte
@@ -108,19 +104,30 @@ func (s *socket) readLoop() {
 
 		if err != nil {
 			fmt.Println(err.Error())
-			closeCode := make([]byte, 2)
-			binary.BigEndian.PutUint16(closeCode, CloseCodeProtocolError)
-			s.sendClose(closeCode)
+			switch err {
+			case io.EOF:
+				// connection dropped, nothing we can do here
+			case ErrInvalidUTF8:
+				s.sendCloseWithCode(CloseCodeInconsistentData)
+			default:
+				s.sendCloseWithCode(CloseCodeProtocolError)
+			}
 			return
 		}
 
 		switch f.Opcode {
 		case byte(MESSAGE_TYPE_TEXT):
-			s.messageHandler(f.Opcode, bytes.NewReader(f.Payload), f.Fin)
+			s.frameHandler(f.Opcode, f.Payload, f.Fin)
+			if f.Fin && s.textHandler != nil {
+				s.textHandler(string(f.Payload))
+			}
 		case byte(MESSAGE_TYPE_BINARY):
-			s.messageHandler(f.Opcode, bytes.NewReader(f.Payload), f.Fin)
+			s.frameHandler(f.Opcode, f.Payload, f.Fin)
+			if f.Fin && s.binaryHandler != nil {
+				s.binaryHandler(f.Payload)
+			}
 		case byte(OPCODE_CONTINUATION):
-			s.messageHandler(f.Opcode, bytes.NewReader(f.Payload), f.Fin)
+			s.frameHandler(f.Opcode, f.Payload, f.Fin)
 		case byte(OPCODE_PING):
 			s.sendPong(f.Payload)
 		case byte(OPCODE_CLOSE):
@@ -144,14 +151,18 @@ func (s *socket) sendPong(payload []byte) {
 	s.conn.Write(data)
 }
 
+func (s *socket) sendCloseWithCode(code uint16) {
+	closeCode := make([]byte, 2)
+	binary.BigEndian.PutUint16(closeCode, code)
+	s.sendClose(closeCode)
+}
 func (s *socket) sendClose(payload []byte) {
 	data := createMessageFrame(bytes.NewReader(payload), uint64(len(payload)), OPCODE_CLOSE, true)
 	// TODO: handle error
 	s.conn.Write(data)
 }
 
-func (s *socket) SendMessage(messageType byte, r io.Reader, fin bool) error {
-	log.Default().Println("Sending frame")
+func (s *socket) sendFrame(messageType byte, r io.Reader, fin bool) error {
 	buf := make([]byte, 4096)
 	var payload []byte
 	for {
@@ -168,8 +179,24 @@ func (s *socket) SendMessage(messageType byte, r io.Reader, fin bool) error {
 	return err
 }
 
-func (s *socket) OnFrame(handler FrameHandler) {
-	s.messageHandler = handler
+func (s *socket) OnFrame(h FrameHandler) {
+	s.frameHandler = h
+}
+
+func (s *socket) OnText(h TextHandler) {
+	s.textHandler = h
+}
+
+func (s *socket) OnBinary(h BinaryHandler) {
+	s.binaryHandler = h
+}
+
+func (s *socket) OnStreamStart(h StreamStartHandler) {
+	panic("Not implemented")
+}
+
+func (s *socket) SendMessage(t byte, r io.Reader) {
+	panic("Not implemented")
 }
 
 func (s *socket) Close() error {
@@ -179,8 +206,22 @@ func (s *socket) Close() error {
 	return s.conn.Close()
 }
 
+var (
+	ErrInvalidRSV             = errors.New("INVALID RSV")
+	ErrInvalidOpcode          = errors.New("INVALID OPCODE")
+	ErrReservedOpcode         = errors.New("RESERVED OPCODE")
+	ErrInvalidContinuation    = errors.New("INVALID CONTINUATION FRAME")
+	ErrUnmaskedframe          = errors.New("UNMASKED FRAME")
+	ErrFragmentedControlFrame = errors.New("FRAGMENTED CONTROL FRAME")
+	ErrInvalidClosePayload    = errors.New("INVALID CLOSE PAYLOAD")
+	ErrInvalidUTF8            = errors.New("INVALID UTF8")
+)
+
 func (s *socket) readFrame() (*frame, error) {
-	frameStart := readAll(s.conn, 2)
+	frameStart, err := readAll(s.conn, 2)
+	if err != nil {
+		return nil, err
+	}
 	flags := frameStart[0]
 	fin := flags&0x80 != 0
 	rsv1 := flags&0x40 != 0
@@ -188,7 +229,7 @@ func (s *socket) readFrame() (*frame, error) {
 	rsv3 := flags&0x10 != 0
 
 	if rsv1 || rsv2 || rsv3 {
-		return nil, errors.New("INVALID RSV")
+		return nil, ErrInvalidRSV
 	}
 	opcode := flags & 0x0f
 
@@ -197,15 +238,15 @@ func (s *socket) readFrame() (*frame, error) {
 	isReservedOpcode := (opcode & 0x7) > 2
 
 	if isReservedOpcode {
-		return nil, errors.New("RESERVED OPCODE")
+		return nil, ErrReservedOpcode
 	}
 
 	if s.isContinuing && opcode != OPCODE_CONTINUATION && !isControlFrame(opcode) {
-		return nil, errors.New("INVALID OPCODE")
+		return nil, ErrInvalidOpcode
 	}
 
 	if !s.isContinuing && opcode == OPCODE_CONTINUATION {
-		return nil, errors.New("INVALID CONTINUATION FRAME")
+		return nil, ErrInvalidContinuation
 	}
 
 	if !isControlFrame(opcode) && opcode != OPCODE_CONTINUATION {
@@ -215,18 +256,24 @@ func (s *socket) readFrame() (*frame, error) {
 	secondByte := frameStart[1]
 	mask := secondByte&0x80 != 0
 	if !mask {
-		return nil, errors.New("UNMASKED FRAME")
+		return nil, ErrUnmaskedframe
 	}
 
 	if isControlFrame(opcode) && !fin {
-		return nil, errors.New("FRAGMENTED CONTROL FRAME")
+		return nil, ErrFragmentedControlFrame
 	}
 	payloadLength, err := s.resolvePayloadLength(secondByte&0x7f, isControlFrame(opcode))
 	if err != nil {
 		return nil, err
 	}
-	maskingKey := readAll(s.conn, 4)
-	payloadData := readAll(s.conn, payloadLength)
+	maskingKey, err := readAll(s.conn, 4)
+	if err != nil {
+		return nil, err
+	}
+	payloadData, err := readAll(s.conn, payloadLength)
+	if err != nil {
+		return nil, err
+	}
 	unmasked := unmaskData(payloadData, maskingKey)
 
 	if s.fragmentedMsgType == OPCODE_TEXT && !isControlFrame(opcode) {
@@ -237,7 +284,7 @@ func (s *socket) readFrame() (*frame, error) {
 	}
 
 	if opcode == OPCODE_CLOSE && payloadLength > 2 && !utf8.Valid(unmasked[2:]) {
-		return nil, errors.New("INVALID CLOSE PAYLOAD")
+		return nil, ErrInvalidClosePayload
 	}
 
 	return &frame{
@@ -268,17 +315,17 @@ func (s *socket) validTextFragment(payload []byte, fin bool) error {
 		end = end - 1
 		if end < len(payload)-3 {
 			// this fragment is invalid on its own
-			return errors.New("INVALID TEXT PAYLOAD")
+			return ErrInvalidUTF8
 		}
 	}
 	// We check the validity exluded the possibly dangling code
 	if !utf8.Valid(payload[0:end]) {
-		return errors.New("INVALID TEXT PAYLOAD")
+		return ErrInvalidUTF8
 	}
 
 	// also if the first dangling byte cannot start a rune there's no point continuing
 	if end != len(payload) && !utf8.RuneStart(payload[end]) {
-		return errors.New("INVALID TEXT PAYLOAD")
+		return ErrInvalidUTF8
 	}
 
 	return nil
@@ -298,7 +345,10 @@ func (s *socket) resolvePayloadLength(firstLengthByte byte, isControlFrame bool)
 		nBytes = 8
 	}
 	payloadLength := uint64(0)
-	lengthBytes := readAll(s.conn, uint64(nBytes))
+	lengthBytes, err := readAll(s.conn, uint64(nBytes))
+	if err != nil {
+		return 0, err
+	}
 	for i := nBytes - 1; i >= 0; i-- {
 		b := lengthBytes[nBytes-1-i]
 		payloadLength = payloadLength | (uint64(b) << (i * 8))
@@ -331,7 +381,7 @@ func createMessageFrame(r io.Reader, payloadLength uint64, opCode byte, fin bool
 		}
 	}
 
-	payload := readAll(r, payloadLength)
+	payload, _ := readAll(r, payloadLength)
 
 	frame := make([]byte, len(header)+int(payloadLength))
 	copy(frame, header)
@@ -350,9 +400,9 @@ func unmaskData(data []byte, mask []byte) []byte {
 	return unmasked
 }
 
-func readAll(r io.Reader, length uint64) []byte {
+func readAll(r io.Reader, length uint64) ([]byte, error) {
 	if length == 0 {
-		return []byte{}
+		return []byte{}, nil
 	}
 	b := make([]byte, length)
 	received := 0
@@ -362,13 +412,13 @@ func readAll(r io.Reader, length uint64) []byte {
 		received += n
 		if err != nil {
 			// TODO: handle this (close the connection)
-			panic(err)
+			return nil, err
 		}
 		if n == len(missing) {
 			break
 		}
 	}
-	return b
+	return b, nil
 }
 
 func isControlFrame(opcode byte) bool {
