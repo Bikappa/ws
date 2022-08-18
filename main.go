@@ -6,13 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"strings"
 )
 
 func main() {
 	sv := ws.NewServer()
 
-	sv.Listen("localhost:9000", func(err error, s ws.Socket) {
+	sv.Listen(":9000", func(err error, s ws.Socket) {
 
 		if err != nil {
 			panic(err)
@@ -22,19 +21,19 @@ func main() {
 		var fragments [][]byte
 
 		s.OnMessage(func(fragmentType byte, r io.Reader, fin bool) {
-			buf := new(strings.Builder)
+			buf := new(bytes.Buffer)
 			io.Copy(buf, r)
-			// check errors
 
-			fragmentData := []byte(buf.String())
-			fmt.Println("received", hex.Dump(fragmentData), fin)
-			fragments = append(fragments, fragmentData)
-			fmt.Print(fragments)
+			fmt.Println("Received frame")
+			fmt.Println("Fin:", fin)
+			fmt.Println("FragmentType:", fragmentType)
+			fmt.Println(hex.Dump(buf.Bytes()))
+			fragments = append(fragments, buf.Bytes())
 			if len(fragments) == 1 {
 				msgType = fragmentType
 			}
 
-			if fin == true {
+			if fin {
 				for i, data := range fragments {
 					fragmentOpcode := msgType
 					if i != 0 {

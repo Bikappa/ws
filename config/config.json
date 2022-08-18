@@ -1,5 +1,5 @@
 {
-  "cases": ["6.2.3"],
+  "cases": ["*"],
   "exclude-cases": [],
   "exclude-agent-cases": {},
   "outdir": "/reports",

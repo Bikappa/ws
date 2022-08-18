@@ -2,6 +2,7 @@ package ws
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -19,6 +20,31 @@ const (
 	OPCODE_PING         = 0x9
 	OPCODE_PONG         = 0xa
 )
+
+const (
+	CloseCodeNormal               = uint16(1000)
+	CloseCodeGoingAway            = uint16(1001)
+	CloseCodeProtocolError        = uint16(1002)
+	CloseCodeUnacceptableMessage  = uint16(1003)
+	CloseCodeInconsistentData     = uint16(1007)
+	CloseCodePolicyViolated       = uint16(1008)
+	CloseCodeMessageTooBig        = uint16(1009)
+	CloseCodeUnsupportedExtension = uint16(1010)
+	CloseCodeUnexpectedCondition  = uint16(1011)
+)
+
+var validCloseCodes map[uint16]bool = map[uint16]bool{
+	CloseCodeNormal:               true,
+	CloseCodeGoingAway:            true,
+	CloseCodeProtocolError:        true,
+	CloseCodeUnacceptableMessage:  true,
+	CloseCodeInconsistentData:     true,
+	CloseCodePolicyViolated:       true,
+	CloseCodeMessageTooBig:        true,
+	CloseCodeUnsupportedExtension: true,
+	CloseCodeUnexpectedCondition:  true,
+}
+
 const (
 	MESSAGE_TYPE_TEXT   = OPCODE_TEXT
 	MESSAGE_TYPE_BINARY = OPCODE_BINARY
@@ -59,8 +85,7 @@ func (s *socket) readLoop() {
 		case byte(OPCODE_PING):
 			s.sendPong(f.Payload)
 		case byte(OPCODE_CLOSE):
-			fmt.Println("CLOSING")
-			s.sendClose(f.Payload)
+			s.sendClose(ensureValidCloseCode(f.Payload))
 			return
 		}
 
@@ -115,8 +140,6 @@ func (cl *socket) Close() error {
 
 func (s *socket) readFrame() (*frame, error) {
 	frameStart := readAll(s.conn, 2)
-	fmt.Println("Frame start")
-	fmt.Println(hex.Dump(frameStart))
 	flags := frameStart[0]
 	fin := flags&0x80 != 0
 	rsv1 := flags&0x40 != 0
@@ -158,7 +181,6 @@ func (s *socket) readFrame() (*frame, error) {
 		return nil, errors.New("FRAGMENTED CONTROL FRAME")
 	}
 	payloadLength, err := s.resolvePayloadLength(secondByte&0x7f, isControlFrame(opcode))
-	fmt.Println("payloadLength:", payloadLength)
 	if err != nil {
 		return nil, err
 	}
@@ -166,15 +188,15 @@ func (s *socket) readFrame() (*frame, error) {
 	payloadData := readAll(s.conn, payloadLength)
 	unmasked := unmaskData(payloadData, maskingKey)
 
-	if s.fragmentedMsgType == OPCODE_TEXT {
+	if s.fragmentedMsgType == OPCODE_TEXT && !isControlFrame(opcode) {
 		err = s.validTextFragment(unmasked, fin)
 		if err != nil {
 			return &frame{}, err
 		}
 	}
 
-	if fin && !isControlFrame(opcode) {
-		s.danglingUTF8Bytes = []byte{}
+	if opcode == OPCODE_CLOSE && payloadLength > 2 && !utf8.Valid(unmasked[2:]) {
+		return nil, errors.New("INVALID CLOSE PAYLOAD")
 	}
 
 	return &frame{
@@ -186,48 +208,35 @@ func (s *socket) readFrame() (*frame, error) {
 }
 
 func (s *socket) validTextFragment(payload []byte, fin bool) error {
-	// append the dangling bytes from previews frame
-	if len(s.danglingUTF8Bytes) > 0 {
-		fmt.Println("Using previous fragment dangling bytes")
-		fmt.Println(hex.EncodeToString(s.danglingUTF8Bytes))
-	}
 	payload = append(s.danglingUTF8Bytes, payload...)
 	end := len(payload)
 	for {
 
 		if fin {
 			// last fragment can't have a dangling invalid utf8 code
+			s.danglingUTF8Bytes = []byte{}
 			break
 		}
 
-		r, runeLength := utf8.DecodeLastRune(payload[0:end])
+		r, _ := utf8.DecodeLastRune(payload[:end])
 		if r != utf8.RuneError || end == 0 {
-			dangling := payload[end-runeLength : end]
-			if len(dangling) > 0 {
-				fmt.Println("Saving possible dangling utf8 code", hex.EncodeToString(dangling))
-				s.danglingUTF8Bytes = dangling
-			}
+			dangling := payload[end:]
+			s.danglingUTF8Bytes = dangling
 			break
 		}
 		end = end - 1
 		if end < len(payload)-3 {
-			fmt.Println("Too long invalid suffix")
 			// this fragment is invalid on its own
 			return errors.New("INVALID TEXT PAYLOAD")
 		}
 	}
-
 	// We check the validity exluded the possibly dangling code
-	fmt.Println("Validation", hex.EncodeToString(payload[0:end]))
 	if !utf8.Valid(payload[0:end]) {
-		fmt.Println("Invalid fragment payload")
-		fmt.Println(payload[0:end], s.danglingUTF8Bytes, fin)
 		return errors.New("INVALID TEXT PAYLOAD")
 	}
 
 	// also if the first dangling byte cannot start a rune there's no point continuing
 	if end != len(payload) && !utf8.RuneStart(payload[end]) {
-		fmt.Println("Not a rune start")
 		return errors.New("INVALID TEXT PAYLOAD")
 	}
 
@@ -240,7 +249,7 @@ func (s *socket) resolvePayloadLength(firstLengthByte byte, isControlFrame bool)
 	}
 
 	if isControlFrame {
-		return 0, errors.New("Invalid control frame. Payload too long")
+		return 0, errors.New("INVALID CONTROL FRAME. PAYLOAD TOO LONG")
 	}
 
 	nBytes := 2
@@ -323,4 +332,27 @@ func readAll(r io.Reader, length uint64) []byte {
 
 func isControlFrame(opcode byte) bool {
 	return (opcode & 0x8) == 0x8
+}
+
+func ensureValidCloseCode(payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	forcedCloseCode := make([]byte, 2)
+	if len(payload) == 1 {
+		binary.BigEndian.PutUint16(forcedCloseCode, CloseCodeProtocolError)
+		return forcedCloseCode
+	}
+
+	receivedCloseCode := binary.BigEndian.Uint16(payload[0:2])
+	if _, ok := validCloseCodes[receivedCloseCode]; ok {
+		return payload
+	}
+
+	if receivedCloseCode >= 3000 && receivedCloseCode < 5000 {
+		return payload
+	}
+
+	binary.BigEndian.PutUint16(forcedCloseCode, CloseCodeProtocolError)
+	return forcedCloseCode
 }
