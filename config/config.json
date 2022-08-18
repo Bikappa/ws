@@ -1,0 +1,13 @@
+{
+  "cases": ["6.2.3"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {},
+  "outdir": "/reports",
+  "options": {"failByDrop": false},
+  "servers": [
+    {
+      "agent": "ReadAllWriteMessage",
+      "url": "ws://host.docker.internal:9000/"
+    }
+  ]
+}

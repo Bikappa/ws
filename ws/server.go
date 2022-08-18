@@ -4,23 +4,21 @@ import (
 	"bufio"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 )
 
 const ACCEPT_KEY_SUFFIX = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-const (
-	MESSAGE_TYPE_TEXT   = 1
-	MESSAGE_TYPE_BINARY = 2
-)
 
-type MessageHandler func(byte, io.Reader)
+type MessageHandler func(byte, io.Reader, bool)
 type Socket interface {
 	OnMessage(handler MessageHandler)
-	SendMessage(messageType byte, r io.Reader) error
+	SendMessage(messageType byte, r io.Reader, fin bool) error
 	Close() error
 }
 
@@ -54,11 +52,13 @@ func (s *server) acceptLoop() {
 		} else {
 			err = s.handshake(conn)
 			if err != nil {
+				fmt.Println(err)
 				conn.Close()
+				continue
 			}
 			c := &socket{
 				conn: conn,
-				messageHandler: func(messsageType byte, r io.Reader) {
+				messageHandler: func(messsageType byte, r io.Reader, fin bool) {
 				},
 			}
 			go c.readLoop()
@@ -73,35 +73,30 @@ func (s *server) handshake(rw io.ReadWriter) error {
 
 	// Read status line
 	scanner.Scan()
-	headers := map[string]string{}
-
-	for {
-		scanner.Scan()
-		line := scanner.Text()
-		if line == "" {
-			break
-		}
-
-		headerParts := strings.Split(line, ": ")
-		headers[headerParts[0]] = headerParts[1]
-	}
-
-	if value, ok := headers["Connection"]; !ok || value != "Upgrade" {
+	log.Println(scanner.Text())
+	headers := scanHeaders(scanner)
+	if value, ok := headers["connection"]; !ok || strings.ToLower(value) != "upgrade" {
 		return errors.New("MISSING UPGRADE")
 	}
 
-	if value, ok := headers["Upgrade"]; !ok || value != "websocket" {
+	if value, ok := headers["upgrade"]; !ok || strings.ToLower(value) != "websocket" {
 		return errors.New("INVALID UPGRADE")
 	}
 
-	acceptKey := generateWebsocketAccept(headers["Sec-WebSocket-Key"])
-	responseMessage := fmt.Sprintf(
-		`HTTP/1.1 101 Switching Protocols
-Connection: Upgrade
-Upgrade: websocket
-Sec-WebSocket-Accept: %s
+	if _, ok := headers["sec-websocket-key"]; !ok {
+		return errors.New("INVALID WEBSOCKET KEY")
+	}
 
-`, acceptKey)
+	acceptKey := generateWebsocketAccept(headers["sec-websocket-key"])
+
+	responseMessage := strings.Join([]string{
+		"HTTP/1.1 101 Switching Protocols",
+		"Connection: Upgrade",
+		"Upgrade: websocket",
+		fmt.Sprintf("Sec-WebSocket-Accept: %s", acceptKey),
+		"\r\n",
+	}, "\r\n")
+	fmt.Println(hex.Dump([]byte(responseMessage)))
 	if _, err := rw.Write([]byte(responseMessage)); err != nil {
 		return err
 	}
@@ -109,6 +104,7 @@ Sec-WebSocket-Accept: %s
 }
 
 func generateWebsocketAccept(key string) string {
+	log.Println("key:", key)
 	concatenation := fmt.Sprintf("%s%s", key, ACCEPT_KEY_SUFFIX)
 
 	h := sha1.New()
@@ -119,4 +115,25 @@ func generateWebsocketAccept(key string) string {
 
 func NewServer() Server {
 	return &server{}
+}
+
+func scanHeaders(scanner *bufio.Scanner) map[string]string {
+	headers := map[string]string{}
+
+	for {
+		scanner.Scan()
+		line := scanner.Text()
+		if line == "" {
+			break
+		}
+
+		headerParts := strings.Split(line, ":")
+		fmt.Println(headerParts)
+		headerKey := strings.ToLower(headerParts[0])
+		headerValue := strings.Trim(headerParts[1], " ")
+		headers[headerKey] = headerValue
+	}
+
+	fmt.Println(headers)
+	return headers
 }

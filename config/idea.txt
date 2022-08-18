@@ -1,0 +1,30 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"unicode/utf8"
+)
+
+func main() {
+
+	buf, err := hex.DecodeString("cebae1bdb9cf83cebcceb5f4")
+	fmt.Println("buf", buf, err)
+	end := len(buf)
+	for {
+		r, _ := utf8.DecodeLastRune(buf[0:end])
+		if r != utf8.RuneError {
+			break
+		}
+		end = end - 1
+	}
+
+	fmt.Println("Valid until last", utf8.Valid(buf[0:end]))
+	r, i := utf8.DecodeLastRune(buf)
+	fmt.Println(r == utf8.RuneError, r, i)
+
+	r, i = utf8.DecodeLastRune(buf[0 : len(buf)-1])
+	fmt.Println(r == utf8.RuneError, r, i)
+
+	fmt.Println(utf8.RuneStart(buf[len(buf)-1]))
+}
