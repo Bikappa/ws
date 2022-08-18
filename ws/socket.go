@@ -3,7 +3,6 @@ package ws
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +10,25 @@ import (
 	"net"
 	"unicode/utf8"
 )
+
+type SocketV2 interface {
+	OnText(h TextHandler)
+	OnBinary(h BinaryHandler)
+	OnStream(h StreamStartHandler)
+	Close() error
+}
+
+type MessageType uint16
+type FrameHandler func(byte, io.Reader, bool)
+type TextHandler func(text string)
+type BinaryHandler func(data []byte)
+type StreamStartHandler func(t *MessageType, r io.Reader)
+
+type Socket interface {
+	OnFrame(handler FrameHandler)
+	SendMessage(messageType byte, r io.Reader, fin bool) error
+	Close() error
+}
 
 const (
 	OPCODE_CONTINUATION = 0x0
@@ -52,10 +70,11 @@ const (
 
 type socket struct {
 	conn              net.Conn
-	messageHandler    MessageHandler
-	isContinuoning    bool
+	messageHandler    FrameHandler
+	isContinuing      bool
 	fragmentedMsgType byte
 	danglingUTF8Bytes []byte
+	serverQuit        chan bool
 }
 
 type frame struct {
@@ -65,13 +84,33 @@ type frame struct {
 	Payload []byte
 }
 
+func (s *socket) run() {
+	readCompleted := make(chan bool)
+
+	go func() {
+		s.readLoop()
+		readCompleted <- true
+	}()
+
+	select {
+	case <-readCompleted:
+		return
+	case <-s.serverQuit:
+		s.Close()
+		return
+	}
+}
+
 func (s *socket) readLoop() {
-	defer s.Close()
+	defer s.conn.Close()
 	for {
 		f, err := s.readFrame()
 
 		if err != nil {
 			fmt.Println(err.Error())
+			closeCode := make([]byte, 2)
+			binary.BigEndian.PutUint16(closeCode, CloseCodeProtocolError)
+			s.sendClose(closeCode)
 			return
 		}
 
@@ -91,9 +130,9 @@ func (s *socket) readLoop() {
 
 		if !isControlFrame(f.Opcode) {
 			if !f.Fin {
-				s.isContinuoning = true
+				s.isContinuing = true
 			} else {
-				s.isContinuoning = false
+				s.isContinuing = false
 			}
 		}
 	}
@@ -124,18 +163,20 @@ func (s *socket) SendMessage(messageType byte, r io.Reader, fin bool) error {
 	}
 	// TODO: provide option to read all till EOF in creteMessageFrom
 	data := createMessageFrame(bytes.NewReader(payload), uint64(len(payload)), messageType, fin)
-	fmt.Println(hex.Dump(data))
 	// TODO: handle error
 	_, err := s.conn.Write(data)
 	return err
 }
 
-func (s *socket) OnMessage(handler MessageHandler) {
+func (s *socket) OnFrame(handler FrameHandler) {
 	s.messageHandler = handler
 }
 
-func (cl *socket) Close() error {
-	return cl.conn.Close()
+func (s *socket) Close() error {
+	closeCode := make([]byte, 2)
+	binary.BigEndian.PutUint16(closeCode, CloseCodeGoingAway)
+	s.sendClose(closeCode)
+	return s.conn.Close()
 }
 
 func (s *socket) readFrame() (*frame, error) {
@@ -159,11 +200,11 @@ func (s *socket) readFrame() (*frame, error) {
 		return nil, errors.New("RESERVED OPCODE")
 	}
 
-	if s.isContinuoning && opcode != OPCODE_CONTINUATION && !isControlFrame(opcode) {
+	if s.isContinuing && opcode != OPCODE_CONTINUATION && !isControlFrame(opcode) {
 		return nil, errors.New("INVALID OPCODE")
 	}
 
-	if !s.isContinuoning && opcode == OPCODE_CONTINUATION {
+	if !s.isContinuing && opcode == OPCODE_CONTINUATION {
 		return nil, errors.New("INVALID CONTINUATION FRAME")
 	}
 

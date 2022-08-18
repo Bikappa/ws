@@ -15,21 +15,16 @@ import (
 
 const ACCEPT_KEY_SUFFIX = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-type MessageHandler func(byte, io.Reader, bool)
-type Socket interface {
-	OnMessage(handler MessageHandler)
-	SendMessage(messageType byte, r io.Reader, fin bool) error
-	Close() error
-}
-
 type AcceptHandler func(error, Socket)
 type Server interface {
 	Listen(url string, handler AcceptHandler) error
+	Close() error
 }
 
 type server struct {
 	listener      net.Listener
 	acceptHandler AcceptHandler
+	quitCh        chan bool
 }
 
 func (s *server) Listen(url string, handler AcceptHandler) error {
@@ -42,6 +37,11 @@ func (s *server) Listen(url string, handler AcceptHandler) error {
 		s.acceptLoop()
 	}
 
+	return nil
+}
+
+func (s *server) Close() error {
+	close(s.quitCh)
 	return nil
 }
 
@@ -60,6 +60,7 @@ func (s *server) acceptLoop() {
 				conn: conn,
 				messageHandler: func(messsageType byte, r io.Reader, fin bool) {
 				},
+				serverQuit: s.quitCh,
 			}
 			go c.readLoop()
 

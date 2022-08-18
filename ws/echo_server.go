@@ -1,17 +1,18 @@
-package main
+package ws
 
 import (
-	"bikappa/ws"
 	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
 )
 
-func main() {
-	sv := ws.NewServer()
+type EchoServer struct {
+	srv Server
+}
 
-	sv.Listen(":9000", func(err error, s ws.Socket) {
+func (e *EchoServer) Listen(url string) {
+	e.srv.Listen(url, func(err error, s Socket) {
 
 		if err != nil {
 			panic(err)
@@ -28,6 +29,7 @@ func main() {
 			fmt.Println("Fin:", fin)
 			fmt.Println("FragmentType:", fragmentType)
 			fmt.Println(hex.Dump(buf.Bytes()))
+
 			fragments = append(fragments, buf.Bytes())
 			if len(fragments) == 1 {
 				msgType = fragmentType
@@ -37,7 +39,7 @@ func main() {
 				for i, data := range fragments {
 					fragmentOpcode := msgType
 					if i != 0 {
-						fragmentOpcode = ws.OPCODE_CONTINUATION
+						fragmentOpcode = OPCODE_CONTINUATION
 					}
 					s.SendMessage(fragmentOpcode, bytes.NewReader(data), i == len(fragments)-1)
 				}
@@ -45,4 +47,10 @@ func main() {
 			}
 		})
 	})
+}
+
+func NewEchoServer() *EchoServer {
+	return &EchoServer{
+		srv: NewServer(),
+	}
 }
