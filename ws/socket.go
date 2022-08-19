@@ -1,21 +1,26 @@
 package ws
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 type Socket interface {
+	Run()
 	OnText(h TextHandler)
 	OnBinary(h BinaryHandler)
 	OnStreamStart(h StreamStartHandler)
 	SendMessage(messageType byte, r io.Reader)
 	Close() error
+	Status() int
 }
 
 type MessageType uint16
@@ -62,6 +67,13 @@ const (
 	MESSAGE_TYPE_BINARY = OPCODE_BINARY
 )
 
+const (
+	SocketStatusOpening = 1
+	SocketStatusOpen    = 2
+	SocketStatusClosing = 3
+	SocketStatusClosed  = 4
+)
+
 type socket struct {
 	conn              net.Conn
 	frameHandler      FrameHandler
@@ -71,6 +83,7 @@ type socket struct {
 	fragmentedMsgType byte
 	danglingUTF8Bytes []byte
 	serverQuit        chan bool
+	status            int
 }
 
 type frame struct {
@@ -80,40 +93,38 @@ type frame struct {
 	Payload []byte
 }
 
-func (s *socket) run() {
-	readCompleted := make(chan bool)
+func (s *socket) Run() {
 
+	defer s.conn.Close()
 	go func() {
-		s.readLoop()
-		readCompleted <- true
-	}()
-
-	select {
-	case <-readCompleted:
-		return
-	case <-s.serverQuit:
+		<-s.serverQuit
 		s.Close()
 		return
-	}
+	}()
+	s.readLoop()
+	s.Close()
 }
 
 func (s *socket) readLoop() {
-	defer s.conn.Close()
 	for {
 		f, err := s.readFrame()
 
 		if err != nil {
-			fmt.Println(err.Error())
+			fmt.Println("err1", err.Error())
 			switch err {
 			case io.EOF:
 				// connection dropped, nothing we can do here
+				s.status = SocketStatusClosed
 			case ErrInvalidUTF8:
 				s.sendCloseWithCode(CloseCodeInconsistentData)
+				s.status = SocketStatusClosing
 			default:
 				s.sendCloseWithCode(CloseCodeProtocolError)
+				s.status = SocketStatusClosing
 			}
-			return
+			break
 		}
+		fmt.Printf("RX Fin=%t Opcode=%d Len=%d\n", f.Fin, f.Opcode, len(f.Payload))
 
 		switch f.Opcode {
 		case byte(MESSAGE_TYPE_TEXT):
@@ -131,8 +142,14 @@ func (s *socket) readLoop() {
 		case byte(OPCODE_PING):
 			s.sendPong(f.Payload)
 		case byte(OPCODE_CLOSE):
-			s.sendClose(ensureValidCloseCode(f.Payload))
-			return
+			if s.status != SocketStatusClosing {
+				s.sendClose(ensureValidCloseCode(f.Payload))
+				s.status = SocketStatusClosed
+			}
+		}
+
+		if f.Opcode == byte(OPCODE_CLOSE) {
+			break
 		}
 
 		if !isControlFrame(f.Opcode) {
@@ -141,6 +158,17 @@ func (s *socket) readLoop() {
 			} else {
 				s.isContinuing = false
 			}
+		}
+	}
+}
+
+func (s *socket) waitForCloseReply(replyCh chan interface{}) {
+	if s.status == SocketStatusClosing {
+		select {
+		case <-replyCh:
+			fmt.Println("Socket closed nicely")
+		case <-time.After(time.Second):
+			fmt.Println("Socket close reply timeout")
 		}
 	}
 }
@@ -156,24 +184,18 @@ func (s *socket) sendCloseWithCode(code uint16) {
 	binary.BigEndian.PutUint16(closeCode, code)
 	s.sendClose(closeCode)
 }
+
 func (s *socket) sendClose(payload []byte) {
-	data := createMessageFrame(bytes.NewReader(payload), uint64(len(payload)), OPCODE_CLOSE, true)
-	// TODO: handle error
-	s.conn.Write(data)
+	s.sendFrame(OPCODE_CLOSE, bytes.NewReader(payload), true)
 }
 
 func (s *socket) sendFrame(messageType byte, r io.Reader, fin bool) error {
-	buf := make([]byte, 4096)
-	var payload []byte
-	for {
-		n, err := r.Read(buf)
-		payload = append(payload, buf[0:n]...)
-		if err == io.EOF {
-			break
-		}
-	}
+	buf := bytes.NewBuffer([]byte{})
+	io.Copy(buf, r)
 	// TODO: provide option to read all till EOF in creteMessageFrom
-	data := createMessageFrame(bytes.NewReader(payload), uint64(len(payload)), messageType, fin)
+
+	fmt.Printf("TX Fin=%t Opcode=%d Len=%d\n", fin, messageType, buf.Len())
+	data := createMessageFrame(bytes.NewReader(buf.Bytes()), uint64(buf.Len()), messageType, fin)
 	// TODO: handle error
 	_, err := s.conn.Write(data)
 	return err
@@ -200,22 +222,89 @@ func (s *socket) SendMessage(t byte, r io.Reader) {
 }
 
 func (s *socket) Close() error {
-	closeCode := make([]byte, 2)
-	binary.BigEndian.PutUint16(closeCode, CloseCodeGoingAway)
-	s.sendClose(closeCode)
+
+	for {
+		switch s.status {
+		case SocketStatusClosed:
+			return nil
+		case SocketStatusClosing:
+			replyCh := make(chan interface{})
+			go func() {
+				fmt.Println("Waiting for close reply from peer")
+				for {
+					// closing the connection will ensure this routine ends
+					f, err := s.readFrame()
+					if err != nil {
+						fmt.Println("err2", err.Error())
+						return
+					}
+
+					if f.Opcode == OPCODE_CLOSE {
+						replyCh <- true
+					}
+				}
+			}()
+
+			s.waitForCloseReply(replyCh)
+			s.status = SocketStatusClosed
+		default:
+			closeCode := make([]byte, 2)
+			binary.BigEndian.PutUint16(closeCode, CloseCodeGoingAway)
+			s.sendClose(closeCode)
+			s.status = SocketStatusClosing
+		}
+
+		if s.status != SocketStatusClosing {
+			break
+		}
+	}
 	return s.conn.Close()
 }
 
-var (
-	ErrInvalidRSV             = errors.New("INVALID RSV")
-	ErrInvalidOpcode          = errors.New("INVALID OPCODE")
-	ErrReservedOpcode         = errors.New("RESERVED OPCODE")
-	ErrInvalidContinuation    = errors.New("INVALID CONTINUATION FRAME")
-	ErrUnmaskedframe          = errors.New("UNMASKED FRAME")
-	ErrFragmentedControlFrame = errors.New("FRAGMENTED CONTROL FRAME")
-	ErrInvalidClosePayload    = errors.New("INVALID CLOSE PAYLOAD")
-	ErrInvalidUTF8            = errors.New("INVALID UTF8")
-)
+func (c *socket) handshake() error {
+
+	scanner := bufio.NewScanner(c.conn)
+
+	// Read status line
+	scanner.Scan()
+	headers := scanHeaders(scanner)
+	if value, ok := headers["connection"]; !ok || strings.ToLower(value) != "upgrade" {
+		c.status = SocketStatusClosed
+		return ErrMissingUpgrade
+	}
+
+	if value, ok := headers["upgrade"]; !ok || strings.ToLower(value) != "websocket" {
+		c.status = SocketStatusClosed
+		return ErrInvalidUpgrade
+	}
+
+	if _, ok := headers["sec-websocket-key"]; !ok {
+		c.status = SocketStatusClosed
+		return ErrInvalidWebsocketKey
+	}
+
+	acceptKey := generateWebsocketAccept(headers["sec-websocket-key"])
+
+	responseMessage := strings.Join([]string{
+		"HTTP/1.1 101 Switching Protocols",
+		"Connection: Upgrade",
+		"Upgrade: websocket",
+		fmt.Sprintf("Sec-WebSocket-Accept: %s", acceptKey),
+		"\r\n",
+	}, "\r\n")
+
+	if _, err := c.conn.Write([]byte(responseMessage)); err != nil {
+		c.status = SocketStatusClosed
+		return err
+	}
+
+	c.status = SocketStatusOpen
+	return nil
+}
+
+func (s *socket) Status() int {
+	return s.status
+}
 
 func (s *socket) readFrame() (*frame, error) {
 	frameStart, err := readAll(s.conn, 2)

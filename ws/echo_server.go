@@ -2,8 +2,6 @@ package ws
 
 import (
 	"bytes"
-	"encoding/hex"
-	"fmt"
 )
 
 type EchoServer struct {
@@ -29,12 +27,6 @@ func (e *EchoServer) Listen(url string) {
 
 		is.OnFrame(func(fragmentType byte, payload []byte, fin bool) {
 
-			fmt.Println("Received frame")
-			fmt.Println("Fin:", fin)
-			fmt.Println("FragmentType:", fragmentType)
-			fmt.Println("length:", len(payload))
-			fmt.Println(hex.Dump(payload))
-
 			fragments = append(fragments, payload)
 			if len(fragments) == 1 {
 				msgType = fragmentType
@@ -51,6 +43,8 @@ func (e *EchoServer) Listen(url string) {
 				fragments = nil
 			}
 		})
+
+		go s.Run()
 	})
 }
 
