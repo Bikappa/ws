@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -94,8 +93,6 @@ type frame struct {
 }
 
 func (s *socket) Run() {
-
-	defer s.conn.Close()
 	go func() {
 		<-s.serverQuit
 		s.Close()
@@ -122,7 +119,7 @@ func (s *socket) readLoop() {
 				s.sendCloseWithCode(CloseCodeProtocolError)
 				s.status = SocketStatusClosing
 			}
-			break
+			return
 		}
 		fmt.Printf("RX Fin=%t Opcode=%d Len=%d\n", f.Fin, f.Opcode, len(f.Payload))
 
@@ -149,7 +146,7 @@ func (s *socket) readLoop() {
 		}
 
 		if f.Opcode == byte(OPCODE_CLOSE) {
-			break
+			return
 		}
 
 		if !isControlFrame(f.Opcode) {
@@ -162,15 +159,30 @@ func (s *socket) readLoop() {
 	}
 }
 
-func (s *socket) waitForCloseReply(replyCh chan interface{}) {
-	if s.status == SocketStatusClosing {
-		select {
-		case <-replyCh:
-			fmt.Println("Socket closed nicely")
-		case <-time.After(time.Second):
-			fmt.Println("Socket close reply timeout")
+func (s *socket) Close() error {
+
+	for {
+		switch s.status {
+		case SocketStatusClosed:
+			return s.conn.Close()
+		case SocketStatusClosing:
+			// If we were nice we would wait for the endpoint to reply our close message
+			// Unfortunately this leads to some complications
+			// For example, we need to read the offending message entirely before we can
+			// read the close reply (or any other frame)
+			s.status = SocketStatusClosed
+		default:
+			closeCode := make([]byte, 2)
+			binary.BigEndian.PutUint16(closeCode, CloseCodeGoingAway)
+			s.sendClose(closeCode)
+			s.status = SocketStatusClosing
+		}
+
+		if s.status != SocketStatusClosing {
+			break
 		}
 	}
+	return s.conn.Close()
 }
 
 func (s *socket) sendPong(payload []byte) {
@@ -219,46 +231,6 @@ func (s *socket) OnStreamStart(h StreamStartHandler) {
 
 func (s *socket) SendMessage(t byte, r io.Reader) {
 	panic("Not implemented")
-}
-
-func (s *socket) Close() error {
-
-	for {
-		switch s.status {
-		case SocketStatusClosed:
-			return nil
-		case SocketStatusClosing:
-			replyCh := make(chan interface{})
-			go func() {
-				fmt.Println("Waiting for close reply from peer")
-				for {
-					// closing the connection will ensure this routine ends
-					f, err := s.readFrame()
-					if err != nil {
-						fmt.Println("err2", err.Error())
-						return
-					}
-
-					if f.Opcode == OPCODE_CLOSE {
-						replyCh <- true
-					}
-				}
-			}()
-
-			s.waitForCloseReply(replyCh)
-			s.status = SocketStatusClosed
-		default:
-			closeCode := make([]byte, 2)
-			binary.BigEndian.PutUint16(closeCode, CloseCodeGoingAway)
-			s.sendClose(closeCode)
-			s.status = SocketStatusClosing
-		}
-
-		if s.status != SocketStatusClosing {
-			break
-		}
-	}
-	return s.conn.Close()
 }
 
 func (c *socket) handshake() error {
