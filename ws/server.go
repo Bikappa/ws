@@ -46,7 +46,8 @@ func (s *server) acceptLoop() {
 
 	for {
 		if conn, err := s.listener.Accept(); err != nil {
-			s.acceptHandler(err, &socket{})
+			s.acceptHandler(err, nil)
+			break
 		} else {
 
 			c := &socket{
