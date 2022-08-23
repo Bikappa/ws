@@ -2,6 +2,9 @@ package ws
 
 import (
 	"bytes"
+	"encoding/hex"
+	"fmt"
+	"io"
 )
 
 type EchoServer struct {
@@ -42,6 +45,22 @@ func (e *EchoServer) Listen(url string) {
 				}
 				fragments = nil
 			}
+		})
+
+		is.OnStreamStart(func(t MessageType, r io.Reader) {
+			go func() {
+				fmt.Println("Stream started")
+
+				for {
+					buf := make([]byte, 64)
+					_, err := io.ReadFull(r, buf)
+					hex.Dump(buf)
+					if err != nil {
+						fmt.Println("Stream ended", err)
+						break
+					}
+				}
+			}()
 		})
 
 		go s.Run()

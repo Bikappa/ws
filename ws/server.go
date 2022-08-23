@@ -50,7 +50,7 @@ func (s *server) acceptLoop() {
 		} else {
 
 			c := &socket{
-				conn: conn,
+				rwc: conn,
 				frameHandler: func(messsageType byte, payload []byte, fin bool) {
 				},
 				serverQuit: s.quitCh,
@@ -60,6 +60,7 @@ func (s *server) acceptLoop() {
 			if err != nil {
 				fmt.Println(err)
 				conn.Close()
+				s.acceptHandler(err, nil)
 			} else {
 				s.acceptHandler(nil, c)
 			}

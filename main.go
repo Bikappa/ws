@@ -6,6 +6,5 @@ import (
 
 func main() {
 	sv := ws.NewEchoServer()
-
 	sv.Listen(":9000")
 }

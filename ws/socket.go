@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"strings"
 	"unicode/utf8"
 )
@@ -22,11 +21,11 @@ type Socket interface {
 	Status() int
 }
 
-type MessageType uint16
+type MessageType byte
 type FrameHandler func(byte, []byte, bool)
 type TextHandler func(text string)
 type BinaryHandler func(data []byte)
-type StreamStartHandler func(t *MessageType, r io.Reader)
+type StreamStartHandler func(t MessageType, r io.Reader)
 
 const (
 	OPCODE_CONTINUATION = 0x0
@@ -74,15 +73,16 @@ const (
 )
 
 type socket struct {
-	conn              net.Conn
-	frameHandler      FrameHandler
-	textHandler       TextHandler
-	binaryHandler     BinaryHandler
-	isContinuing      bool
-	fragmentedMsgType byte
-	danglingUTF8Bytes []byte
-	serverQuit        chan bool
-	status            int
+	rwc                io.ReadWriteCloser
+	frameHandler       FrameHandler
+	textHandler        TextHandler
+	binaryHandler      BinaryHandler
+	streamStartHandler StreamStartHandler
+	streamWriter       io.WriteCloser
+	fragmentedMsgType  byte
+	danglingUTF8Bytes  []byte
+	serverQuit         chan bool
+	status             int
 }
 
 type frame struct {
@@ -124,12 +124,12 @@ func (s *socket) readLoop() {
 		fmt.Printf("RX Fin=%t Opcode=%d Len=%d\n", f.Fin, f.Opcode, len(f.Payload))
 
 		switch f.Opcode {
-		case byte(MESSAGE_TYPE_TEXT):
+		case byte(OPCODE_TEXT):
 			s.frameHandler(f.Opcode, f.Payload, f.Fin)
 			if f.Fin && s.textHandler != nil {
 				s.textHandler(string(f.Payload))
 			}
-		case byte(MESSAGE_TYPE_BINARY):
+		case byte(OPCODE_BINARY):
 			s.frameHandler(f.Opcode, f.Payload, f.Fin)
 			if f.Fin && s.binaryHandler != nil {
 				s.binaryHandler(f.Payload)
@@ -149,12 +149,24 @@ func (s *socket) readLoop() {
 			return
 		}
 
-		if !isControlFrame(f.Opcode) {
-			if !f.Fin {
-				s.isContinuing = true
+		if f.Fin && f.Opcode == OPCODE_CONTINUATION {
+			s.streamWriter.Close()
+			s.streamWriter = nil
+		}
+
+		if !f.Fin && f.Opcode != OPCODE_CONTINUATION {
+			var r io.Reader
+			var w io.WriteCloser
+			if s.streamStartHandler != nil {
+				r, w = io.Pipe()
 			} else {
-				s.isContinuing = false
+				w = WriterNopCloser{io.Discard}
 			}
+			s.streamWriter = w
+			if s.streamStartHandler != nil {
+				s.streamStartHandler(MessageType(f.Opcode), r)
+			}
+			w.Write(f.Payload)
 		}
 	}
 }
@@ -164,7 +176,7 @@ func (s *socket) Close() error {
 	for {
 		switch s.status {
 		case SocketStatusClosed:
-			return s.conn.Close()
+			return s.rwc.Close()
 		case SocketStatusClosing:
 			// If we were nice we would wait for the endpoint to reply our close message
 			// Unfortunately this leads to some complications
@@ -182,13 +194,13 @@ func (s *socket) Close() error {
 			break
 		}
 	}
-	return s.conn.Close()
+	return s.rwc.Close()
 }
 
 func (s *socket) sendPong(payload []byte) {
 	data := createMessageFrame(bytes.NewReader(payload), uint64(len(payload)), OPCODE_PONG, true)
 	// TODO: handle error
-	s.conn.Write(data)
+	s.rwc.Write(data)
 }
 
 func (s *socket) sendCloseWithCode(code uint16) {
@@ -204,12 +216,10 @@ func (s *socket) sendClose(payload []byte) {
 func (s *socket) sendFrame(messageType byte, r io.Reader, fin bool) error {
 	buf := bytes.NewBuffer([]byte{})
 	io.Copy(buf, r)
-	// TODO: provide option to read all till EOF in creteMessageFrom
 
 	fmt.Printf("TX Fin=%t Opcode=%d Len=%d\n", fin, messageType, buf.Len())
 	data := createMessageFrame(bytes.NewReader(buf.Bytes()), uint64(buf.Len()), messageType, fin)
-	// TODO: handle error
-	_, err := s.conn.Write(data)
+	_, err := s.rwc.Write(data)
 	return err
 }
 
@@ -226,7 +236,7 @@ func (s *socket) OnBinary(h BinaryHandler) {
 }
 
 func (s *socket) OnStreamStart(h StreamStartHandler) {
-	panic("Not implemented")
+	s.streamStartHandler = h
 }
 
 func (s *socket) SendMessage(t byte, r io.Reader) {
@@ -235,7 +245,7 @@ func (s *socket) SendMessage(t byte, r io.Reader) {
 
 func (c *socket) handshake() error {
 
-	scanner := bufio.NewScanner(c.conn)
+	scanner := bufio.NewScanner(c.rwc)
 
 	// Read status line
 	scanner.Scan()
@@ -265,7 +275,7 @@ func (c *socket) handshake() error {
 		"\r\n",
 	}, "\r\n")
 
-	if _, err := c.conn.Write([]byte(responseMessage)); err != nil {
+	if _, err := c.rwc.Write([]byte(responseMessage)); err != nil {
 		c.status = SocketStatusClosed
 		return err
 	}
@@ -279,7 +289,7 @@ func (s *socket) Status() int {
 }
 
 func (s *socket) readFrame() (*frame, error) {
-	frameStart, err := readAll(s.conn, 2)
+	frameStart, err := readAll(s.rwc, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -301,17 +311,19 @@ func (s *socket) readFrame() (*frame, error) {
 	if isReservedOpcode {
 		return nil, ErrReservedOpcode
 	}
+	continuationExpected := s.streamWriter != nil
+	if !isControlFrame(opcode) {
+		if continuationExpected && opcode != OPCODE_CONTINUATION {
+			return nil, ErrInvalidOpcode
+		}
 
-	if s.isContinuing && opcode != OPCODE_CONTINUATION && !isControlFrame(opcode) {
-		return nil, ErrInvalidOpcode
-	}
+		if !continuationExpected && opcode == OPCODE_CONTINUATION {
+			return nil, ErrInvalidContinuation
+		}
 
-	if !s.isContinuing && opcode == OPCODE_CONTINUATION {
-		return nil, ErrInvalidContinuation
-	}
-
-	if !isControlFrame(opcode) && opcode != OPCODE_CONTINUATION {
-		s.fragmentedMsgType = opcode
+		if opcode != OPCODE_CONTINUATION {
+			s.fragmentedMsgType = opcode
+		}
 	}
 
 	secondByte := frameStart[1]
@@ -327,11 +339,11 @@ func (s *socket) readFrame() (*frame, error) {
 	if err != nil {
 		return nil, err
 	}
-	maskingKey, err := readAll(s.conn, 4)
+	maskingKey, err := readAll(s.rwc, 4)
 	if err != nil {
 		return nil, err
 	}
-	payloadData, err := readAll(s.conn, payloadLength)
+	payloadData, err := readAll(s.rwc, payloadLength)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +418,7 @@ func (s *socket) resolvePayloadLength(firstLengthByte byte, isControlFrame bool)
 		nBytes = 8
 	}
 	payloadLength := uint64(0)
-	lengthBytes, err := readAll(s.conn, uint64(nBytes))
+	lengthBytes, err := readAll(s.rwc, uint64(nBytes))
 	if err != nil {
 		return 0, err
 	}
