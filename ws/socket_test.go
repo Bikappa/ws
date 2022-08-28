@@ -17,29 +17,38 @@ func (mrwc *MockedReadWriteCloser) Close() error {
 	return nil
 }
 
-func createTestSocket() (Socket, io.ReadWriteCloser) {
-	clientToServer := bytes.NewBuffer([]byte{})
-	serverToClient := bytes.NewBuffer([]byte{})
+func createTestSocket() (*socket, io.ReadWriteCloser) {
+	serverR, clientW := io.Pipe()
+	clientR, serverW := io.Pipe()
 	socket := &socket{
 		rwc: &MockedReadWriteCloser{
-			clientToServer,
-			serverToClient,
+			serverR,
+			serverW,
 			false,
 		},
 	}
 
 	return socket, &MockedReadWriteCloser{
-		serverToClient,
-		clientToServer,
+		clientR,
+		clientW,
 		false,
 	}
 }
 
 func TestPingReply(t *testing.T) {
-	_, rwc := createTestSocket()
+	s, rwc := createTestSocket()
+
+	go s.readLoop()
 
 	payloadReader := bytes.NewReader([]byte("hello"))
-	rwc.Write(createMessageFrame(payloadReader, uint64(payloadReader.Len()), OPCODE_PING, true))
+	rwc.Write(encodeFrame(
+		FrameEncodeOptions{
+			r:             payloadReader,
+			payloadLength: uint64(payloadReader.Len()),
+			opCode:        OPCODE_PING,
+			fin:           true,
+			mask:          true,
+		}))
 
 	frame, err := decodeFrame(decodeFrameSettings{
 		reader:                          rwc,

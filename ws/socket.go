@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"strings"
 	"unicode/utf8"
 )
@@ -199,7 +200,7 @@ func (s *socket) Close() error {
 }
 
 func (s *socket) sendPong(payload []byte) {
-	data := createMessageFrame(bytes.NewReader(payload), uint64(len(payload)), OPCODE_PONG, true)
+	data := generateMessageFrame(bytes.NewReader(payload), uint64(len(payload)), OPCODE_PONG, true)
 	// TODO: handle error
 	s.rwc.Write(data)
 }
@@ -219,7 +220,7 @@ func (s *socket) sendFrame(messageType byte, r io.Reader, fin bool) error {
 	io.Copy(buf, r)
 
 	fmt.Printf("TX Fin=%t Opcode=%d Len=%d\n", fin, messageType, buf.Len())
-	data := createMessageFrame(bytes.NewReader(buf.Bytes()), uint64(buf.Len()), messageType, fin)
+	data := generateMessageFrame(bytes.NewReader(buf.Bytes()), uint64(buf.Len()), messageType, fin)
 	_, err := s.rwc.Write(data)
 	return err
 }
@@ -368,7 +369,7 @@ func decodeFrame(settings decodeFrameSettings) (*frame, error) {
 
 	var unmasked []byte = payloadData
 	if mask {
-		unmasked = unmaskData(payloadData, maskingKey)
+		unmasked = maskData(payloadData, maskingKey)
 	}
 
 	var danglingBytes = settings.danglingUTF8Bytes
@@ -454,7 +455,31 @@ func resolvePayloadLength(r io.Reader, firstLengthByte byte, isControlFrame bool
 	return payloadLength, nil
 }
 
-func createMessageFrame(r io.Reader, payloadLength uint64, opCode byte, fin bool) []byte {
+type FrameEncodeOptions struct {
+	r             io.Reader
+	payloadLength uint64
+	opCode        byte
+	fin           bool
+	mask          bool
+}
+
+func generateMessageFrame(r io.Reader, payloadLength uint64, opCode byte, fin bool) []byte {
+	return encodeFrame(FrameEncodeOptions{
+		opCode:        opCode,
+		fin:           fin,
+		r:             r,
+		payloadLength: payloadLength,
+		mask:          false,
+	})
+}
+
+func encodeFrame(options FrameEncodeOptions) []byte {
+
+	opCode := options.opCode
+	fin := options.fin
+	payloadLength := options.payloadLength
+	r := options.r
+
 	start := byte(0x00)
 	if fin {
 		start = 0x80
@@ -462,25 +487,36 @@ func createMessageFrame(r io.Reader, payloadLength uint64, opCode byte, fin bool
 	header := []byte{
 		start | opCode,
 	}
-	var payloadLengthBytes int
+	var extraPayloadLengthBytes int = 0
+	var firstPayloadLengthByte byte
 	if payloadLength <= 125 {
-		header = append(header, uint8(payloadLength))
+		firstPayloadLengthByte = uint8(payloadLength)
 	} else {
 		if payloadLength <= uint64(0xffff) {
-			header = append(header, uint8(126))
-			payloadLengthBytes = 2
+			firstPayloadLengthByte = uint8(126)
+			extraPayloadLengthBytes = 2
 		} else {
-			header = append(header, uint8(127))
-			payloadLengthBytes = 8
+			firstPayloadLengthByte = uint8(127)
+			extraPayloadLengthBytes = 8
 		}
-
-		for i := payloadLengthBytes - 1; i >= 0; i-- {
-			header = append(header, uint8(payloadLength>>(i*8)))
-		}
+	}
+	maskBit := byte(0x0)
+	if options.mask {
+		maskBit = 0x80
+	}
+	header = append(header, maskBit|firstPayloadLengthByte)
+	for i := extraPayloadLengthBytes - 1; i >= 0; i-- {
+		header = append(header, uint8(payloadLength>>(i*8)))
 	}
 
 	payload, _ := readAll(r, payloadLength)
 
+	if options.mask {
+		maskKey := make([]byte, 4)
+		binary.BigEndian.PutUint32(maskKey, rand.Uint32())
+		payload = maskData(payload, maskKey)
+		header = append(header, maskKey...)
+	}
 	frame := make([]byte, len(header)+int(payloadLength))
 	copy(frame, header)
 
@@ -490,12 +526,12 @@ func createMessageFrame(r io.Reader, payloadLength uint64, opCode byte, fin bool
 	return frame
 }
 
-func unmaskData(data []byte, mask []byte) []byte {
-	unmasked := make([]byte, len(data))
+func maskData(data []byte, mask []byte) []byte {
+	transformed := make([]byte, len(data))
 	for i, b := range data {
-		unmasked[i] = b ^ mask[i%4]
+		transformed[i] = b ^ mask[i%4]
 	}
-	return unmasked
+	return transformed
 }
 
 func readAll(r io.Reader, length uint64) ([]byte, error) {
