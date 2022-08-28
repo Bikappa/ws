@@ -73,23 +73,24 @@ const (
 )
 
 type socket struct {
-	rwc                io.ReadWriteCloser
-	frameHandler       FrameHandler
-	textHandler        TextHandler
-	binaryHandler      BinaryHandler
-	streamStartHandler StreamStartHandler
-	streamWriter       io.WriteCloser
-	fragmentedMsgType  byte
-	danglingUTF8Bytes  []byte
-	serverQuit         chan bool
-	status             int
+	rwc                             io.ReadWriteCloser
+	frameHandler                    FrameHandler
+	textHandler                     TextHandler
+	binaryHandler                   BinaryHandler
+	streamStartHandler              StreamStartHandler
+	streamWriter                    io.WriteCloser
+	expectedContinuationMessageType byte
+	danglingUTF8Bytes               []byte
+	serverQuit                      chan bool
+	status                          int
 }
 
 type frame struct {
-	Fin     bool
-	Rsvs    []bool
-	Opcode  byte
-	Payload []byte
+	Fin               bool
+	Rsvs              []bool
+	Opcode            byte
+	Payload           []byte
+	DanglingUTF8Bytes []byte
 }
 
 func (s *socket) Run() {
@@ -152,21 +153,21 @@ func (s *socket) readLoop() {
 		if f.Fin && f.Opcode == OPCODE_CONTINUATION {
 			s.streamWriter.Close()
 			s.streamWriter = nil
+			s.expectedContinuationMessageType = 0
 		}
 
-		if !f.Fin && f.Opcode != OPCODE_CONTINUATION {
-			var r io.Reader
-			var w io.WriteCloser
-			if s.streamStartHandler != nil {
-				r, w = io.Pipe()
-			} else {
-				w = WriterNopCloser{io.Discard}
+		if !f.Fin {
+			if f.Opcode != OPCODE_CONTINUATION {
+				s.expectedContinuationMessageType = f.Opcode
+				if s.streamStartHandler != nil {
+					r, w := io.Pipe()
+					s.streamWriter = w
+					s.streamStartHandler(MessageType(f.Opcode), r)
+				} else {
+					s.streamWriter = WriterNopCloser{io.Discard}
+				}
 			}
-			s.streamWriter = w
-			if s.streamStartHandler != nil {
-				s.streamStartHandler(MessageType(f.Opcode), r)
-			}
-			w.Write(f.Payload)
+			s.streamWriter.Write(f.Payload)
 		}
 	}
 }
@@ -289,7 +290,25 @@ func (s *socket) Status() int {
 }
 
 func (s *socket) readFrame() (*frame, error) {
-	frameStart, err := readAll(s.rwc, 2)
+	// non-control frames (0 first bit) higher than 2 are reserved
+	// control frames (1 first bit) higher than 10 are reserved
+	return decodeFrame(decodeFrameSettings{
+		reader:                          s.rwc,
+		expectedContinuationMessageType: s.expectedContinuationMessageType,
+		danglingUTF8Bytes:               s.danglingUTF8Bytes,
+		expectedMask:                    true,
+	})
+}
+
+type decodeFrameSettings struct {
+	reader                          io.Reader
+	expectedContinuationMessageType byte
+	danglingUTF8Bytes               []byte
+	expectedMask                    bool
+}
+
+func decodeFrame(settings decodeFrameSettings) (*frame, error) {
+	frameStart, err := readAll(settings.reader, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -304,14 +323,12 @@ func (s *socket) readFrame() (*frame, error) {
 	}
 	opcode := flags & 0x0f
 
-	// non-control frames (0 first bit) higher than 2 are reserved
-	// control frames (1 first bit) higher than 10 are reserved
 	isReservedOpcode := (opcode & 0x7) > 2
 
 	if isReservedOpcode {
 		return nil, ErrReservedOpcode
 	}
-	continuationExpected := s.streamWriter != nil
+	continuationExpected := settings.expectedContinuationMessageType != 0
 	if !isControlFrame(opcode) {
 		if continuationExpected && opcode != OPCODE_CONTINUATION {
 			return nil, ErrInvalidOpcode
@@ -320,37 +337,43 @@ func (s *socket) readFrame() (*frame, error) {
 		if !continuationExpected && opcode == OPCODE_CONTINUATION {
 			return nil, ErrInvalidContinuation
 		}
-
-		if opcode != OPCODE_CONTINUATION {
-			s.fragmentedMsgType = opcode
-		}
 	}
 
 	secondByte := frameStart[1]
 	mask := secondByte&0x80 != 0
-	if !mask {
+	if !mask && settings.expectedMask {
 		return nil, ErrUnmaskedframe
 	}
 
 	if isControlFrame(opcode) && !fin {
 		return nil, ErrFragmentedControlFrame
 	}
-	payloadLength, err := s.resolvePayloadLength(secondByte&0x7f, isControlFrame(opcode))
+	payloadLength, err := resolvePayloadLength(settings.reader, secondByte&0x7f, isControlFrame(opcode))
 	if err != nil {
 		return nil, err
 	}
-	maskingKey, err := readAll(s.rwc, 4)
-	if err != nil {
-		return nil, err
-	}
-	payloadData, err := readAll(s.rwc, payloadLength)
-	if err != nil {
-		return nil, err
-	}
-	unmasked := unmaskData(payloadData, maskingKey)
 
-	if s.fragmentedMsgType == OPCODE_TEXT && !isControlFrame(opcode) {
-		err = s.validTextFragment(unmasked, fin)
+	var maskingKey []byte
+	if mask {
+		maskingKey, err = readAll(settings.reader, 4)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	payloadData, err := readAll(settings.reader, payloadLength)
+	if err != nil {
+		return nil, err
+	}
+
+	var unmasked []byte = payloadData
+	if mask {
+		unmasked = unmaskData(payloadData, maskingKey)
+	}
+
+	var danglingBytes = settings.danglingUTF8Bytes
+	if settings.expectedContinuationMessageType == OPCODE_TEXT && !isControlFrame(opcode) {
+		danglingBytes, err = validTextFragment(unmasked, settings.danglingUTF8Bytes, fin)
 		if err != nil {
 			return &frame{}, err
 		}
@@ -361,50 +384,52 @@ func (s *socket) readFrame() (*frame, error) {
 	}
 
 	return &frame{
-		Fin:     fin,
-		Rsvs:    []bool{rsv1, rsv2, rsv3},
-		Opcode:  opcode,
-		Payload: unmasked,
+		Fin:               fin,
+		Rsvs:              []bool{rsv1, rsv2, rsv3},
+		Opcode:            opcode,
+		Payload:           unmasked,
+		DanglingUTF8Bytes: danglingBytes,
 	}, nil
 }
 
-func (s *socket) validTextFragment(payload []byte, fin bool) error {
-	payload = append(s.danglingUTF8Bytes, payload...)
+func validTextFragment(payload []byte, danglingUTF8Bytes []byte, fin bool) ([]byte, error) {
+	payload = append(danglingUTF8Bytes, payload...)
 	end := len(payload)
+	var newDanglingUTF8Bytes []byte
 	for {
 
 		if fin {
 			// last fragment can't have a dangling invalid utf8 code
-			s.danglingUTF8Bytes = []byte{}
+			newDanglingUTF8Bytes = []byte{}
 			break
 		}
 
 		r, _ := utf8.DecodeLastRune(payload[:end])
 		if r != utf8.RuneError || end == 0 {
 			dangling := payload[end:]
-			s.danglingUTF8Bytes = dangling
+			newDanglingUTF8Bytes = dangling
 			break
 		}
 		end = end - 1
 		if end < len(payload)-3 {
 			// this fragment is invalid on its own
-			return ErrInvalidUTF8
+			return nil, ErrInvalidUTF8
 		}
 	}
 	// We check the validity exluded the possibly dangling code
 	if !utf8.Valid(payload[0:end]) {
-		return ErrInvalidUTF8
+		return nil, ErrInvalidUTF8
 	}
 
 	// also if the first dangling byte cannot start a rune there's no point continuing
 	if end != len(payload) && !utf8.RuneStart(payload[end]) {
-		return ErrInvalidUTF8
+		return nil, ErrInvalidUTF8
 	}
 
-	return nil
+	return newDanglingUTF8Bytes, nil
 }
 
-func (s *socket) resolvePayloadLength(firstLengthByte byte, isControlFrame bool) (uint64, error) {
+func resolvePayloadLength(r io.Reader, firstLengthByte byte, isControlFrame bool) (uint64, error) {
 	if firstLengthByte <= 125 {
 		return uint64(firstLengthByte), nil
 	}
@@ -418,7 +443,7 @@ func (s *socket) resolvePayloadLength(firstLengthByte byte, isControlFrame bool)
 		nBytes = 8
 	}
 	payloadLength := uint64(0)
-	lengthBytes, err := readAll(s.rwc, uint64(nBytes))
+	lengthBytes, err := readAll(r, uint64(nBytes))
 	if err != nil {
 		return 0, err
 	}

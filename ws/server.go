@@ -21,6 +21,7 @@ type server struct {
 	listener      net.Listener
 	acceptHandler AcceptHandler
 	quitCh        chan bool
+	isClosed	bool
 }
 
 func (s *server) Listen(url string, handler AcceptHandler) error {
@@ -38,16 +39,20 @@ func (s *server) Listen(url string, handler AcceptHandler) error {
 }
 
 func (s *server) Close() error {
+	s.isClosed = true
+	s.listener.Close()
 	close(s.quitCh)
 	return nil
 }
 
 func (s *server) acceptLoop() {
-
+	
 	for {
 		if conn, err := s.listener.Accept(); err != nil {
 			s.acceptHandler(err, nil)
-			break
+			if s.isClosed {
+				return
+			}
 		} else {
 
 			c := &socket{
@@ -79,7 +84,9 @@ func generateWebsocketAccept(key string) string {
 }
 
 func NewServer() Server {
-	return &server{}
+	return &server{
+		isClosed: false,
+	}
 }
 
 func scanHeaders(scanner *bufio.Scanner) map[string]string {
