@@ -7,7 +7,8 @@ import (
 )
 
 type MockedReadWriteCloser struct {
-	io.ReadWriter
+	io.Reader
+	io.Writer
 	closeCalled bool
 }
 
@@ -17,14 +18,21 @@ func (mrwc *MockedReadWriteCloser) Close() error {
 }
 
 func createTestSocket() (Socket, io.ReadWriteCloser) {
+	clientToServer := bytes.NewBuffer([]byte{})
+	serverToClient := bytes.NewBuffer([]byte{})
 	socket := &socket{
 		rwc: &MockedReadWriteCloser{
-			bytes.NewBuffer([]byte{}),
+			clientToServer,
+			serverToClient,
 			false,
 		},
 	}
 
-	return socket, socket.rwc
+	return socket, &MockedReadWriteCloser{
+		serverToClient,
+		clientToServer,
+		false,
+	}
 }
 
 func TestPingReply(t *testing.T) {
@@ -32,6 +40,7 @@ func TestPingReply(t *testing.T) {
 
 	payloadReader := bytes.NewReader([]byte("hello"))
 	rwc.Write(createMessageFrame(payloadReader, uint64(payloadReader.Len()), OPCODE_PING, true))
+
 	frame, err := decodeFrame(decodeFrameSettings{
 		reader:                          rwc,
 		danglingUTF8Bytes:               []byte{},
@@ -41,13 +50,16 @@ func TestPingReply(t *testing.T) {
 
 	if err != nil {
 		t.Error("Unexpected error while decoding frame", err)
+		return
 	}
 
 	if frame.Opcode != OPCODE_PONG {
 		t.Error("Replied with non-pong opcode", frame.Opcode)
+		return
 	}
 
 	if string(frame.Payload) != "hello" {
 		t.Error("Replied with wrong payload", string(frame.Payload))
+		return
 	}
 }
